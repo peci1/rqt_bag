@@ -224,6 +224,8 @@ class Rosbag2:
         if progress_cb is not None and progress != 100:
             progress_cb(100)
 
+        # No filter
+        self.reader.reset_filter()
         return
 
     def estimate_num_entries_in_range(self, t_start: Time, t_end: Time,
