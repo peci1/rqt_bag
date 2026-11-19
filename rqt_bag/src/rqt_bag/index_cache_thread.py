@@ -61,6 +61,9 @@ class IndexCacheThread(threading.Thread):
                     if not self._stop_flag:
                         self.timeline.scene().background_progress = progress
                         self.timeline.scene().status_bar_changed_signal.emit()
+                        # Show the newly indexed messages on the timeline, so
+                        # that loading progress is visible while indexing.
+                        self.timeline.scene().update()
 
                 topics = self.timeline.invalidated_caches.intersection(set(self.timeline.topics))
                 updated = (self.timeline._update_index_cache(topics, progress_cb) > 0)

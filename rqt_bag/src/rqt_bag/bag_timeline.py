@@ -119,6 +119,11 @@ class BagTimeline(QGraphicsScene):
 
         self.background_progress = 0
         self.__closed = False
+        # Snapshot of {topic: datatype}, rebuilt whenever bags or topics change.
+        # It is read by the GUI thread (painting the timeline) without holding
+        # _bag_lock, which the index cache thread keeps for the whole duration
+        # of the bag indexing.
+        self._topic_datatypes = {}
 
         # Database settings
         self.serialization_format = 'cdr'
@@ -179,8 +184,7 @@ class BagTimeline(QGraphicsScene):
 
         self._timeline_frame._start_stamp = self._get_start_stamp()
         self._timeline_frame._end_stamp = self._get_end_stamp()
-        self._timeline_frame.topics = self._get_topics()
-        self._timeline_frame._topics_by_datatype = self._get_topics_by_datatype()
+        self._refresh_topic_info()
         # If this is the first bag, reset the timeline
         if self._timeline_frame._stamp_left is None:
             self._timeline_frame.reset_timeline()
@@ -204,14 +208,16 @@ class BagTimeline(QGraphicsScene):
 
         :return: first stamp in the bags, ''rclpy.time.Time''
         """
-        with self._bag_lock:
-            start_stamp = None
-            for bag in self._bags:
-                bag_start_stamp = bag.get_earliest_timestamp()
-                if bag_start_stamp is not None and \
-                        (start_stamp is None or bag_start_stamp < start_stamp):
-                    start_stamp = bag_start_stamp
-            return start_stamp
+        # This may run on the GUI thread while the index cache thread holds
+        # _bag_lock for the whole bag indexing, so iterate over a snapshot of
+        # the append-only bag list instead of taking the lock.
+        start_stamp = None
+        for bag in list(self._bags):
+            bag_start_stamp = bag.get_earliest_timestamp()
+            if bag_start_stamp is not None and \
+                    (start_stamp is None or bag_start_stamp < start_stamp):
+                start_stamp = bag_start_stamp
+        return start_stamp
 
     def _get_end_stamp(self):
         """
@@ -219,13 +225,13 @@ class BagTimeline(QGraphicsScene):
 
         :return: last stamp in the bags, ''rclpy.time.Time''
         """
-        with self._bag_lock:
-            end_stamp = None
-            for bag in self._bags:
-                bag_end_stamp = bag.get_latest_timestamp()
-                if bag_end_stamp is not None and (end_stamp is None or bag_end_stamp > end_stamp):
-                    end_stamp = bag_end_stamp
-            return end_stamp
+        # Lock-free like _get_start_stamp, see the comment there.
+        end_stamp = None
+        for bag in list(self._bags):
+            bag_end_stamp = bag.get_latest_timestamp()
+            if bag_end_stamp is not None and (end_stamp is None or bag_end_stamp > end_stamp):
+                end_stamp = bag_end_stamp
+        return end_stamp
 
     def _get_topics(self):
         """
@@ -233,12 +239,12 @@ class BagTimeline(QGraphicsScene):
 
         :return: sorted list of topic names, ''list(str)''
         """
-        with self._bag_lock:
-            topics = set()
-            for bag in self._bags:
-                for topic in bag.get_topics():
-                    topics.add(topic)
-            return sorted(topics)
+        # Lock-free like _get_start_stamp, see the comment there.
+        topics = set()
+        for bag in list(self._bags):
+            for topic in bag.get_topics():
+                topics.add(topic)
+        return sorted(topics)
 
     def _get_topics_by_datatype(self):
         """
@@ -246,30 +252,45 @@ class BagTimeline(QGraphicsScene):
 
         :return: dict of list of topics for each datatype, ''dict(datatype:list(topic))''
         """
-        with self._bag_lock:
-            topics_by_datatype = {}
-            for bag in self._bags:
-                for datatype, topics in bag.get_topics_by_type().items():
-                    topics_by_datatype.setdefault(datatype, []).extend(topics)
-            return topics_by_datatype
+        # Lock-free like _get_start_stamp, see the comment there.
+        topics_by_datatype = {}
+        for bag in list(self._bags):
+            for datatype, topics in bag.get_topics_by_type().items():
+                topics_by_datatype.setdefault(datatype, []).extend(topics)
+        return topics_by_datatype
+
+    def _refresh_topic_info(self):
+        """
+        Refresh the topic info shown by the timeline.
+
+        Updates the topics and topics-by-datatype maps of the timeline frame,
+        and rebuilds the lock-free {topic: datatype} snapshot used for painting
+        the timeline while bags are being indexed.
+        """
+        self._timeline_frame.topics = self._get_topics()
+        self._timeline_frame._topics_by_datatype = self._get_topics_by_datatype()
+
+        topic_datatypes = {}
+        for datatype, topics in self._timeline_frame._topics_by_datatype.items():
+            for topic in topics:
+                if topic in topic_datatypes and topic_datatypes[topic] != datatype:
+                    raise Exception('topic %s has multiple datatypes: %s and %s' %
+                                    (topic, topic_datatypes[topic], datatype))
+                topic_datatypes[topic] = datatype
+        self._topic_datatypes = topic_datatypes
 
     def get_datatype(self, topic):
         """
         Get the datatype for a topic.
 
+        This is called on the GUI thread for every topic while painting the
+        timeline, so it reads a snapshot without holding _bag_lock: the index
+        cache thread holds the lock for the whole duration of the bag indexing.
+
         :return: datatype associated with a topic, ''str''
         :raises: if there are multiple datatypes assigned to a single topic, ''Exception''
         """
-        with self._bag_lock:
-            datatype = None
-            for bag in self._bags:
-                bag_datatype = bag.get_topic_type(topic)
-                if datatype and bag_datatype and (bag_datatype != datatype):
-                    raise Exception('topic %s has multiple datatypes: %s and %s' %
-                                    (topic, datatype, bag_datatype))
-                if bag_datatype:
-                    datatype = bag_datatype
-            return datatype
+        return self._topic_datatypes.get(topic)
 
     def get_entries(self, topics: Optional[Union[str, Iterable[str]]],
                     start_stamp: Time, end_stamp: Time,
@@ -783,8 +804,7 @@ class BagTimeline(QGraphicsScene):
             self._timeline_frame._end_stamp = t
 
         if not self._timeline_frame.topics or topic not in self._timeline_frame.topics:
-            self._timeline_frame.topics = self._get_topics()
-            self._timeline_frame._topics_by_datatype = self._get_topics_by_datatype()
+            self._refresh_topic_info()
 
             self._playhead_positions_cvs[topic] = threading.Condition()
             self._messages_cvs[topic] = threading.Condition()

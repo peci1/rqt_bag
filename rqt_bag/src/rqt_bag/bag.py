@@ -28,7 +28,6 @@
 
 import argparse
 import os
-import threading
 
 from qt_gui.plugin import Plugin
 
@@ -56,12 +55,10 @@ class Bag(Plugin):
                 self._widget.windowTitle() + (' (%d)' % context.serial_number()))
         context.add_widget(self._widget)
 
-        def load_bags():
-            for bagfile in args.bagfiles:
-                self._widget.load_bag(bagfile)
-
-        load_thread = threading.Thread(target=load_bags)
-        load_thread.start()
+        # Bags are opened in the background by the widget, so that the GUI
+        # stays responsive and shows the loading progress right away.
+        for bagfile in args.bagfiles:
+            self._widget.load_bag(bagfile)
 
     def _parse_args(self, argv):
         parser = argparse.ArgumentParser(prog='rqt_bag', add_help=False)

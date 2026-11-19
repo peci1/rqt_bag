@@ -28,12 +28,13 @@
 
 import math
 import os
+import queue
 import time
 
 from ament_index_python import get_resource
 
 from python_qt_binding import loadUi
-from python_qt_binding.QtCore import qDebug, Qt, qWarning, Signal
+from python_qt_binding.QtCore import qDebug, Qt, QThread, qWarning, Signal
 from python_qt_binding.QtGui import QIcon, QResizeEvent
 from python_qt_binding.QtWidgets import QFileDialog, QGraphicsView, QWidget
 
@@ -50,6 +51,45 @@ class BagGraphicsView(QGraphicsView):
 
     def __init__(self, parent=None):
         super(BagGraphicsView, self).__init__()
+
+
+class BagLoaderThread(QThread):
+    """
+    Opens bag files in the background.
+
+    Reading the metadata of a bag can take a long time for large bags, so bags
+    are opened outside of the GUI thread; the opened bag (or the error) is
+    delivered to the GUI thread via the bag_opened signal.
+    """
+
+    bag_opened = Signal(object, object, object)  # (bag or None, filename, error or None)
+
+    def __init__(self):
+        super(BagLoaderThread, self).__init__()
+        self._filenames = queue.Queue()
+
+    def load(self, filename):
+        self._filenames.put(filename)
+
+    def stop(self):
+        self._filenames.put(None)
+        self.wait(2000)
+
+    def run(self):
+        while True:
+            filename = self._filenames.get()
+            if filename is None:
+                return
+            bag, error = None, None
+            try:
+                bag = Rosbag2(filename)
+            except Exception as ex:
+                error = str(ex)
+            try:
+                self.bag_opened.emit(bag, filename, error)
+            except RuntimeError:
+                # The widget was closed while the bag was being opened.
+                return
 
 
 class BagWidget(QWidget):
@@ -138,9 +178,17 @@ class BagWidget(QWidget):
         self.save_button.setEnabled(False)
 
         self._recording = False
+        self._status_text = ''
+        self._closing = False
 
         self._timeline.status_bar_changed_signal.connect(self._update_status_bar)
         self.set_status_text.connect(self._set_status_text)
+
+        # Bags are opened in the background so that the GUI stays responsive
+        # while large bags are being loaded.
+        self._bag_loader = BagLoaderThread()
+        self._bag_loader.bag_opened.connect(self._bag_opened)
+        self._bag_loader.start()
 
     def graphics_view_on_key_press(self, event):
         key = event.key()
@@ -285,6 +333,12 @@ class BagWidget(QWidget):
             self.load_bag(filename)
 
     def load_bag(self, filename):
+        """
+        Load a bag file.
+
+        The bag is opened in the background; the timeline is updated from
+        _bag_opened() once the bag has been read.
+        """
         qDebug("Loading '%s' ..." % filename.encode(errors='replace'))
 
         # QProgressBar can EITHER: show text or show a bouncing loading bar,
@@ -292,16 +346,16 @@ class BagWidget(QWidget):
         #  shown
         # self.progress_bar.setRange(0, 0)
         self.set_status_text.emit("Loading '%s' ..." % os.path.split(filename)[0])
-        # progress_format = self.progress_bar.format()
-        # progress_text_visible = self.progress_bar.isTextVisible()
-        # self.progress_bar.setFormat("Loading %s" % filename)
-        # self.progress_bar.setTextVisible(True)
+        self._bag_loader.load(filename)
 
-        try:
-            bag = Rosbag2(filename)
-        except Exception as e:
-            qWarning("Loading '%s' failed due to: %s" % (filename.encode(errors='replace'), e))
-            self.set_status_text.emit("Loading '%s' failed due to: %s" % (filename, e))
+    def _bag_opened(self, bag, filename, error):
+        """Add a bag opened by the loader thread to the timeline."""
+        if self._closing:
+            return
+        if bag is None:
+            qWarning("Loading '%s' failed due to: %s" %
+                     (filename.encode(errors='replace'), error))
+            self.set_status_text.emit("Loading '%s' failed due to: %s" % (filename, error))
             return
 
         qDebug('Loading bag from metadata file "{}" Succeeded'.format(filename))
@@ -354,6 +408,7 @@ class BagWidget(QWidget):
             self._timeline.copy_region_to_bag(filename[0])
 
     def _set_status_text(self, text):
+        self._status_text = text
         if text:
             self.progress_bar.setFormat(text)
             self.progress_bar.setTextVisible(True)
@@ -385,14 +440,24 @@ class BagWidget(QWidget):
                                  time.localtime(t_sec)) + '.%03d' % (t_nsec * 1e-9)
 
     def _update_status_bar(self):
-        if self._timeline._timeline_frame.playhead is None or \
-                self._timeline._timeline_frame.start_stamp is None:
-            return
         # TODO Figure out why this function is causing a "RuntimeError: wrapped
         # C/C++ object of %S has been deleted" on close if the playhead is moving
         try:
-            # Background Process Status
-            self.progress_bar.setValue(self._timeline.background_progress)
+            # Background Process Status. This is also updated while the playhead
+            # is not set yet, i.e. while a bag is being indexed after loading,
+            # so that the progress bar is visible while loading.
+            background_progress = self._timeline.background_progress
+            if self._status_text == '':
+                if background_progress > 0:
+                    self.progress_bar.setFormat('Indexing %p%')
+                    self.progress_bar.setTextVisible(True)
+                else:
+                    self.progress_bar.setTextVisible(False)
+            self.progress_bar.setValue(background_progress)
+
+            if self._timeline._timeline_frame.playhead is None or \
+                    self._timeline._timeline_frame.start_stamp is None:
+                return
 
             # Raw timestamp
             playhead_sec = bag_helper.to_sec(self._timeline._timeline_frame.playhead)
@@ -433,6 +498,8 @@ class BagWidget(QWidget):
     # Shutdown all members
 
     def shutdown_all(self):
+        self._closing = True
+        self._bag_loader.stop()
         self._timeline.handle_close()
 
     def update_size(self):
