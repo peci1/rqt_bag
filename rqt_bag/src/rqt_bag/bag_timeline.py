@@ -84,6 +84,10 @@ class BagTimeline(QGraphicsScene):
         self._playhead_positions = {}  # topic -> (bag, position)
         self._message_loaders = {}
         self._messages_cvs = {}
+        # Incremented on every playhead change; the message loaders compare it
+        # against the generation they last processed to know when to recompute
+        # the position of the playhead on their topic.
+        self._playhead_generation = 0
         self._messages = {}  # topic -> (bag, msg_data)
         self._message_listener_threads = {}  # listener -> MessageListenerThread
         self._player = False
@@ -801,6 +805,19 @@ class BagTimeline(QGraphicsScene):
         # that might otherwise have exceeded the bounds of the window
         self.reset_zoom()
 
+    def _notify_playhead_changed(self):
+        """
+        Wake all message loaders so they recompute the position of the playhead.
+
+        The loaders resolve the position for their own topic in their own
+        thread, because the lookup can be slow on large bags and the playhead
+        is set from the UI thread (seeking) and once per frame during playback.
+        """
+        self._playhead_generation += 1
+        for cv in self._playhead_positions_cvs.values():
+            with cv:
+                cv.notify_all()
+
     # Views / listeners
     def add_view(self, topic, frame):
         self._views.append(frame)
@@ -815,8 +832,7 @@ class BagTimeline(QGraphicsScene):
             MessageListenerThread(self, topic, listener)
         # Notify the message listeners
         self._message_loaders[topic].reset()
-        with self._playhead_positions_cvs[topic]:
-            self._playhead_positions_cvs[topic].notify_all()
+        self._notify_playhead_changed()
 
         self.update()
 

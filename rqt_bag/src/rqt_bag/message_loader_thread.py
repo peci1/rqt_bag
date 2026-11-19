@@ -43,6 +43,7 @@ class MessageLoaderThread(threading.Thread):
         self.topic = topic
 
         self.bag_playhead_position = None
+        self._seen_playhead_generation = timeline._playhead_generation
 
         self._message_cache_capacity = 50
         self._message_cache = {}
@@ -58,18 +59,31 @@ class MessageLoaderThread(threading.Thread):
 
     def run(self):
         while not self._stop_flag:
-            # Wait for a new entry
+            # Wait for the playhead to move
             cv = self.timeline._playhead_positions_cvs[self.topic]
             with cv:
-                while (self.topic not in self.timeline._playhead_positions) or \
-                        (self.bag_playhead_position ==
-                            self.timeline._playhead_positions[self.topic]):
+                while self.timeline._playhead_generation == self._seen_playhead_generation:
                     cv.wait()
                     if self._stop_flag:
                         return
-                bag, playhead_position = self.timeline._playhead_positions[self.topic]
+                self._seen_playhead_generation = self.timeline._playhead_generation
 
+            # Resolve the position of the playhead on this topic. The lookup
+            # happens here and not in the playhead setter because it can be
+            # slow on large bags, and the playhead is set from the UI thread
+            # when seeking and once per frame during playback.
+            playhead = self.timeline._timeline_frame.playhead
+            if playhead is None:
+                bag, playhead_position = None, None
+            else:
+                bag, entry = self.timeline.get_entry(playhead, self.topic)
+                playhead_position = entry.timestamp if entry is not None else None
+
+            if self.bag_playhead_position == (bag, playhead_position):
+                continue
             self.bag_playhead_position = (bag, playhead_position)
+            with cv:
+                self.timeline._playhead_positions[self.topic] = (bag, playhead_position)
 
             # Don't bother loading the message if there are no listeners
             if not self.timeline.has_listeners(self.topic):

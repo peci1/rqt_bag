@@ -253,20 +253,12 @@ class TimelineFrame(QGraphicsItem):
                     dstamp = self._stamp_left - bag_helper.to_sec(self._start_stamp)
                 self.translate_timeline(-dstamp)
 
-            # Update the playhead positions
-            for topic in self.topics:
-                bag, entry = self.scene().get_entry(self._playhead, topic)
-                if entry:
-                    if topic in self.scene()._playhead_positions and \
-                            self.scene()._playhead_positions[topic] == (bag, entry.timestamp):
-                        continue
-                    new_playhead_position = (bag, entry.timestamp)
-                else:
-                    new_playhead_position = (None, None)
-                with self.scene()._playhead_positions_cvs[topic]:
-                    self.scene()._playhead_positions[topic] = new_playhead_position
-                    # notify all message loaders that a new message needs to be loaded
-                    self.scene()._playhead_positions_cvs[topic].notify_all()
+            # Wake the message loaders so they recompute the position of the
+            # playhead on their topic. The lookups can take a long time on
+            # large bags, and the playhead is set from the UI thread when
+            # seeking and once per frame during playback, so they must not
+            # run here on the caller's thread.
+            self.scene()._notify_playhead_changed()
             self.scene().update()
             self.scene().status_bar_changed_signal.emit()
 
