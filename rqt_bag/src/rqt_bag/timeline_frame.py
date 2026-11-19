@@ -906,10 +906,17 @@ class TimelineFrame(QGraphicsItem):
         end_time = self._end_stamp
 
         newly_added = 0
-        for entry in self.scene().get_entries(topics, start_time, end_time, progress_cb):
-            topic_cache = self.index_cache[entry.topic]
-            topic_cache.append(bag_helper.to_sec(Time(nanoseconds=entry.timestamp)))
-            newly_added += 1
+        topic_stamps = self.scene().get_entries_timestamps(
+            topics, start_time, end_time, progress_cb)
+        for t, stamps in topic_stamps.items():
+            topic_cache = self.index_cache[t]
+            if len(topic_cache) > 0:
+                # The start time can precede this topic's cache when another
+                # topic has a shorter cache; skip the stamps already in it.
+                last_stamp = topic_cache[-1]
+                stamps = [stamp for stamp in stamps if stamp > last_stamp]
+            topic_cache.extend(stamps)
+            newly_added += len(stamps)
 
         for t in topics:
             if t in self.invalidated_caches:

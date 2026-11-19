@@ -26,6 +26,7 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+from decimal import Decimal
 import threading
 import time
 from typing import Callable, Iterable, Iterator, Optional, Tuple, Union
@@ -362,6 +363,73 @@ class BagTimeline(QGraphicsScene):
                     last_entries[min_bag] = None
 
         return
+
+    def get_entries_timestamps(self, topics: Union[str, Iterable[str]],
+                               start_stamp: Time, end_stamp: Time,
+                               progress_cb: Optional[Callable[[int], None]] = None) \
+            -> 'dict[str, list[float]]':
+        """
+        Get the message timestamps in a given range for each topic.
+
+        Bags are queried through their MCAP message index when available,
+        which avoids reading the message payloads, and by reading the entries
+        sequentially otherwise. The returned stamps are sorted per topic.
+
+        :param topics: list of topics to query, ''list(str)''
+        :param start_stamp: stamp to start at, ''rclpy.time.Time''
+        :param end_stamp: stamp to end at, ''rclpy.time.Time''
+        :param progress_cb: callback function to report progress, called once per each percent.
+        :returns: map of topic to sorted list of stamps in seconds, ''dict(str, list(float))''
+        """
+        with self._bag_lock:
+            relevant_bags = []
+            for b in self._bags:
+                bag_start_time = b.get_earliest_timestamp()
+                if bag_start_time is not None and bag_start_time > end_stamp:
+                    continue
+
+                bag_end_time = b.get_latest_timestamp()
+                if bag_end_time is not None and bag_end_time < start_stamp:
+                    continue
+
+                relevant_bags.append(b)
+
+            if progress_cb is not None:
+                progress = 0
+                num_entries = 0
+                estimated_num_entries = 0
+                for b in relevant_bags:
+                    estimated_num_entries += b.estimate_num_entries_in_range(
+                        start_stamp, end_stamp, topics)
+
+            topic_stamps = {}
+            for b in relevant_bags:
+                indexed_stamps = b.entries_timestamps_in_range(start_stamp, end_stamp, topics)
+                if indexed_stamps is not None:
+                    for topic, stamps in indexed_stamps.items():
+                        # Convert exactly like bag_helper.to_sec() to stay
+                        # consistent with the rest of the index cache
+                        converted = [float(Decimal(stamp) * Decimal('1e-9')) for stamp in stamps]
+                        topic_stamps.setdefault(topic, []).extend(converted)
+                    if progress_cb is not None:
+                        num_entries += sum(len(stamps) for stamps in indexed_stamps.values())
+                else:
+                    for entry in b.entries_in_range_generator(start_stamp, end_stamp, topics):
+                        topic_stamps.setdefault(entry.topic, []).append(
+                            bag_helper.to_sec(Time(nanoseconds=entry.timestamp)))
+                        if progress_cb is not None:
+                            num_entries += 1
+                if progress_cb is not None and estimated_num_entries > 0:
+                    new_progress = int(100.0 * (float(num_entries) / estimated_num_entries))
+                    new_progress = min(new_progress, 100)
+                    if new_progress != progress:
+                        progress_cb(new_progress)
+                        progress = new_progress
+
+            for topic in topic_stamps:
+                topic_stamps[topic].sort()
+
+            return topic_stamps
 
     def get_entry(self, t, topic):
         """

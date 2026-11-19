@@ -31,7 +31,8 @@
 
 from collections import namedtuple
 import os
-from typing import Callable, Iterable, Iterator, List, Optional, Union
+import threading
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Union
 
 from rclpy import logging
 from rclpy.clock import Clock, ClockType
@@ -45,6 +46,7 @@ from rosbag2_py import get_default_storage_id, StorageFilter
 from rosidl_runtime_py.utilities import get_message
 
 from rqt_bag import bag_helper
+from rqt_bag.mcap_index import McapIndex
 
 WRITE_ONLY_MSG = 'open for writing only, returning None'
 
@@ -58,6 +60,9 @@ class Rosbag2:
         self.bag_path = bag_path
         self.reader = None
         self._logger = logging.get_logger('rqt_bag.Rosbag2')
+        self._mcap_index = None
+        self._mcap_index_built = False
+        self._mcap_index_lock = threading.Lock()
 
         if recording:
             self.metadata = rosbag2_py.BagMetadata()
@@ -77,6 +82,36 @@ class Rosbag2:
             self.read_order = rosbag2_py.ReadOrder(
                 sort_by=rosbag2_py.ReadOrderSortBy.ReceivedTimestamp,
                 reverse=False)
+
+    def _get_mcap_index(self):
+        """
+        Get the fast MCAP message index of this bag, or None.
+
+        The index is built lazily on first use because it is only needed once the
+        timeline starts reading message stamps, and building it takes a moment
+        for large bags. Any failure disables the fast path permanently: reading
+        then falls back to the storage plugin.
+        """
+        if self._mcap_index_built:
+            return self._mcap_index
+        with self._mcap_index_lock:
+            if self._mcap_index_built:
+                return self._mcap_index
+            self._mcap_index_built = True
+            if self.metadata.storage_identifier != 'mcap' or not self.reader:
+                return None
+            paths = [os.path.join(self.bag_path, relative)
+                     for relative in self.metadata.relative_file_paths]
+            paths = [path for path in paths if path.endswith('.mcap') and os.path.isfile(path)]
+            if not paths:
+                return None
+            try:
+                self._mcap_index = McapIndex(paths)
+            except Exception as e:
+                self._logger.warning(
+                    f'Not using the MCAP index of {self.bag_path}: {e}')
+                self._mcap_index = None
+            return self._mcap_index
 
     def size(self):
         """Get the size of the rosbag."""
@@ -126,6 +161,14 @@ class Rosbag2:
             self._logger.warn('get_entry - ' + WRITE_ONLY_MSG)
             return None
 
+        if topic:
+            mcap_index = self._get_mcap_index()
+            if mcap_index is not None and topic in mcap_index:
+                hit = mcap_index.entry_at_or_before(topic, timestamp.nanoseconds)
+                if hit is not None:
+                    data, entry_timestamp = hit
+                    return Entry(topic, data, entry_timestamp)
+
         self.reader.set_read_order(rosbag2_py.ReadOrder(reverse=True))
         self.reader.seek(timestamp.nanoseconds)
 
@@ -144,6 +187,14 @@ class Rosbag2:
         if not self.reader:
             self._logger.warn('get_entry_after - ' + WRITE_ONLY_MSG)
             return None
+
+        if topic:
+            mcap_index = self._get_mcap_index()
+            if mcap_index is not None and topic in mcap_index:
+                hit = mcap_index.entry_after(topic, timestamp.nanoseconds)
+                if hit is not None:
+                    data, entry_timestamp = hit
+                    return Entry(topic, data, entry_timestamp)
 
         self.reader.set_read_order(rosbag2_py.ReadOrder(reverse=False))
         self.reader.seek(timestamp.nanoseconds + 1)
@@ -179,6 +230,44 @@ class Rosbag2:
             return None
 
         return list(self.entries_in_range_generator(t_start, t_end, topic, progress_cb))
+
+    def entries_timestamps_in_range(self, t_start: Time, t_end: Time,
+                                    topic: Optional[Union[str, Iterable[str]]] = None) \
+            -> Optional[Dict[str, Iterable[int]]]:
+        """
+        Get the message timestamps in a given time range, sorted by receive stamp.
+
+        This uses the MCAP message index when available, avoiding a full read of
+        the bag. When the bag has no such index, None is returned and the caller
+        is expected to fall back to entries_in_range_generator().
+
+        :param t_start: stamp to start at, ''rclpy.time.Time''
+        :param t_end: stamp to end at, ''rclpy.time.Time''
+        :param topic: topic or list of topics to query (if None, all topics are), ''list(str)''
+        :returns: map of topic to sorted timestamps in nanoseconds, or None
+        """
+        if not self.reader:
+            self._logger.warn('entries_timestamps_in_range - ' + WRITE_ONLY_MSG)
+            return None
+
+        mcap_index = self._get_mcap_index()
+        if mcap_index is None:
+            return None
+
+        if isinstance(topic, Iterable) and not isinstance(topic, str):
+            topics = topic
+        elif topic is not None:
+            topics = [topic]
+        else:
+            topics = mcap_index.topics()
+
+        timestamps = {}
+        for topic_name in topics:
+            stamps = mcap_index.timestamps_in_range(
+                topic_name, t_start.nanoseconds, t_end.nanoseconds)
+            if stamps:
+                timestamps[topic_name] = stamps
+        return timestamps
 
     def entries_in_range_generator(self, t_start: Time, t_end: Time,
                                    topic: Optional[Union[str, Iterable[str]]] = None,
